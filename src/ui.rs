@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -14,6 +15,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
+use reqwest::Client;
+use serde_json::Value;
 use std::{
     io::{stdout, Stdout},
     time::{Duration, Instant},
@@ -33,6 +36,7 @@ pub struct UI {
     cursor_position: usize,
     cursor_visible: bool,
     last_cursor_update: Instant,
+    http_client: Client,
 }
 
 impl UI {
@@ -42,12 +46,14 @@ impl UI {
 
         let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend)?;
+        let http_client = Client::new();
 
         Ok(UI {
             terminal,
             cursor_position: 0,
             cursor_visible: true,
             last_cursor_update: Instant::now(),
+            http_client,
         })
     }
 
@@ -151,13 +157,139 @@ impl UI {
             Ok(None)
         }
     }
+    async fn get_ai_prompt(&mut self) -> Result<String> {
+        let mut prompt = String::new();
 
-    pub fn get_new_entry(&mut self) -> Result<DiaryEntry> {
+        self.terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints(
+                    [
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(3),
+                    ]
+                    .as_ref(),
+                )
+                .split(f.area());
+
+            let input = Paragraph::new(prompt.clone()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Enter AI Prompt"),
+            );
+            f.render_widget(input, chunks[0]);
+
+            let instructions = Paragraph::new("Press Enter to submit")
+                .style(Style::default().fg(Color::Yellow))
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(instructions, chunks[1]);
+        })?;
+
+        loop {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Char(c) => prompt.push(c),
+                    KeyCode::Backspace => {
+                        prompt.pop();
+                    }
+                    _ => {}
+                }
+            }
+            self.terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints(
+                        [
+                            Constraint::Length(3),
+                            Constraint::Min(1),
+                            Constraint::Length(3),
+                        ]
+                        .as_ref(),
+                    )
+                    .split(f.area());
+
+                let input = Paragraph::new(prompt.clone()).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Enter AI Prompt"),
+                );
+                f.render_widget(input, chunks[0]);
+
+                let instructions = Paragraph::new("Press Enter to submit")
+                    .style(Style::default().fg(Color::Yellow))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(instructions, chunks[1]);
+            })?;
+        }
+
+        Ok(prompt)
+    }
+
+    async fn get_ai_response(&mut self, prompt: &str) -> Result<String> {
+        let mut response = String::new();
+
+        let request_body = serde_json::json!({
+            "model": "llama3.2",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": true
+        });
+
+        let mut stream = self
+            .http_client
+            .post("http://localhost:11434/api/chat")
+            .json(&request_body)
+            .send()
+            .await?
+            .bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if let Ok(value) = serde_json::from_str::<Value>(&chunk_str) {
+                if let Some(content) = value["message"]["content"].as_str() {
+                    response.push_str(content);
+                    self.terminal.draw(|f| {
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .margin(1)
+                            .constraints([Constraint::Min(1)].as_ref())
+                            .split(f.area());
+
+                        let ai_response = Paragraph::new(response.clone())
+                            .block(Block::default().borders(Borders::ALL).title("AI Response"));
+                        f.render_widget(ai_response, chunks[0]);
+                    })?;
+                }
+                if value["done"].as_bool().unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+
+        Ok(response)
+    }
+
+    // use this function if you want to generate tags by AI
+    async fn _generate_tags(&mut self, content: &str) -> Result<String> {
+        let prompt = format!(
+            "Generate comma-separated tags for the following content: {}",
+            content
+        );
+        let tags = self.get_ai_response(&prompt).await?;
+        Ok(tags)
+    }
+
+    pub async fn get_new_entry(&mut self) -> Result<DiaryEntry> {
         let mut content = String::new();
         let mut tags = String::new();
 
         self.cursor_position = 0;
         let mut last_content_update = Instant::now();
+        let mut ai_prompt_mode = false;
 
         loop {
             let now = Instant::now();
@@ -203,12 +335,15 @@ impl UI {
                         .block(Block::default().borders(Borders::ALL).title("Content"));
                     f.render_widget(content_input, chunks[1]);
 
-                    let tags_input = Paragraph::new(tags.clone()).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Tags (comma-separated)"),
-                    );
-                    f.render_widget(tags_input, chunks[2]);
+                    let mode_info = if ai_prompt_mode {
+                        "AI Prompt Mode (Press 'Esc' to exit)"
+                    } else {
+                        "Manual Typing Mode (Press '*' for AI assistance)"
+                    };
+                    let mode_paragraph = Paragraph::new(mode_info)
+                        .style(Style::default().fg(Color::Yellow))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    f.render_widget(mode_paragraph, chunks[2]);
 
                     let instructions = Paragraph::new("Press Esc to finish")
                         .style(Style::default().fg(Color::Yellow))
@@ -225,32 +360,47 @@ impl UI {
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     match key.code {
-                        KeyCode::Esc => break,
-                        KeyCode::Char(c) => {
+                        KeyCode::Esc => {
+                            if ai_prompt_mode {
+                                ai_prompt_mode = false;
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('*') => {
+                            // ai_prompt_mode = true;
+                            let prompt = self.get_ai_prompt().await?;
+                            let ai_response = self.get_ai_response(&prompt).await?;
+                            content.push_str(&ai_response);
+                            self.cursor_position = content.len();
+                            last_content_update = Instant::now();
+                            ai_prompt_mode = false;
+                        }
+                        KeyCode::Char(c) if !ai_prompt_mode => {
                             content.insert(self.cursor_position, c);
                             self.cursor_position += 1;
                             last_content_update = Instant::now();
                         }
-                        KeyCode::Backspace => {
+                        KeyCode::Backspace if !ai_prompt_mode => {
                             if self.cursor_position > 0 {
                                 content.remove(self.cursor_position - 1);
                                 self.cursor_position -= 1;
                                 last_content_update = Instant::now();
                             }
                         }
-                        KeyCode::Delete => {
+                        KeyCode::Delete if !ai_prompt_mode => {
                             if self.cursor_position < content.len() {
                                 content.remove(self.cursor_position);
                                 last_content_update = Instant::now();
                             }
                         }
-                        KeyCode::Left => {
+                        KeyCode::Left if !ai_prompt_mode => {
                             if self.cursor_position > 0 {
                                 self.cursor_position -= 1;
                                 last_content_update = Instant::now();
                             }
                         }
-                        KeyCode::Right => {
+                        KeyCode::Right if !ai_prompt_mode => {
                             if self.cursor_position < content.len() {
                                 self.cursor_position += 1;
                                 last_content_update = Instant::now();
@@ -294,7 +444,7 @@ impl UI {
                                 last_content_update = Instant::now();
                             }
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter if !ai_prompt_mode => {
                             content.insert(self.cursor_position, '\n');
                             self.cursor_position += 1;
                             last_content_update = Instant::now();
@@ -346,7 +496,8 @@ impl UI {
                     .title("Tags (comma-separated)"),
             );
             f.render_widget(tags_input, chunks[2]);
-            let instructions = Paragraph::new("Press Esc to finish")
+
+            let instructions = Paragraph::new("Press Esc to save")
                 .style(Style::default().fg(Color::Yellow))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(instructions, chunks[3]);
@@ -386,12 +537,19 @@ impl UI {
                         .title("Tags (comma-separated)"),
                 );
                 f.render_widget(tags_input, chunks[2]);
-                let instructions = Paragraph::new("Press Esc to finish")
+
+                let instructions = Paragraph::new("Press Esc to save")
                     .style(Style::default().fg(Color::Yellow))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(instructions, chunks[3]);
             })?;
         }
+
+        // Automatically generate tags based on content
+        // tags = self.generate_tags(&content).await?;
+        //
+        // let tag_list = tags.split(',').map(|s| s.trim().to_string()).collect();
+        // Ok(DiaryEntry::new(0, content, tag_list))
 
         let tag_list = tags.split(',').map(|s| s.trim().to_string()).collect();
         Ok(DiaryEntry::new(0, content, tag_list))
@@ -701,10 +859,6 @@ impl UI {
                     .title("Tags (comma-separated)"),
             );
             f.render_widget(tags_input, chunks[2]);
-            let instructions = Paragraph::new("Press Esc to finish")
-                .style(Style::default().fg(Color::Yellow))
-                .alignment(ratatui::layout::Alignment::Center);
-            f.render_widget(instructions, chunks[3]);
         })?;
 
         loop {
@@ -741,10 +895,6 @@ impl UI {
                         .title("Tags (comma-separated)"),
                 );
                 f.render_widget(tags_input, chunks[2]);
-                let instructions = Paragraph::new("Press Esc to finish")
-                    .style(Style::default().fg(Color::Yellow))
-                    .alignment(ratatui::layout::Alignment::Center);
-                f.render_widget(instructions, chunks[3]);
             })?;
         }
 

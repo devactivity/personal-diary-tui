@@ -6,10 +6,10 @@ use color_eyre::eyre::{eyre, Result};
 use diary_state::DiaryState;
 use ui::{Action, UI};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // let mut diary_state = DiaryState::new();
     let mut diary_state = match DiaryState::load_from_file() {
         Ok(state) => state,
         Err(e) => {
@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         if let Some(action) = ui.handle_input(&diary_state)? {
             match action {
                 Action::Write => {
-                    let entry = ui.get_new_entry()?;
+                    let entry = ui.get_new_entry().await?;
                     diary_state.add_entry(entry);
                 }
                 Action::View => {
